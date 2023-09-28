@@ -1,0 +1,141 @@
+locals {
+  location = var.location
+}
+
+module "prod-resourcegroup" {
+  source = "./Modules/Resourcegroup"
+  
+  location = var.location
+  resource_group_name = "Prod-Rg-001"
+}
+
+module "prod-virtualnetwork" {
+  source = "./Modules/Networking"
+
+  resource_group_name = module.prod-resourcegroup.resource_group_name
+  location = var.location
+  virtualnetwork_name = "prod-vnet-001"
+  virtualnetwork_address_space = ["15.0.0.0/20"]
+  private_subnet_name = "prod-prv-snet"
+  private_subnet_address_space = ["15.0.0.0/22"]
+  public_subnet_name = "prod-pub-snet"
+  public_subnet_address_space = ["15.0.4.0/22"]
+  private_endpoint_subnet_name = "prod-prvenp-snet"
+  private_endpoint_subnet_address_space = ["15.0.8.0/22"]
+  nsg_name = "prod-db-nsg-001"
+}
+
+
+module "prod-storageaccount" {
+  source = "./Modules/StorageAccount"
+
+  resource_group_name = module.prod-resourcegroup.resource_group_name
+  location = var.location
+  storageaccount_name = "myprodstorage00123"
+  account_kind = "StorageV2"
+  account_tier = "Standard"
+  account_replication_type = "LRS"
+  
+}
+
+/*
+module "prod-infra-container" {
+  source = "./Modules/StorageContainer"
+storage_account_id = module.prod-storageaccount.storage_account_id
+container_name = "infracontainer"
+directory_name = "infradirectory"
+
+}
+
+*/
+
+module "prod-databricks_workspace" {
+  source = "./Modules/Databricks"
+
+databricks_workspace_name = "prodeworkspace"
+resource_group_name = module.prod-resourcegroup.resource_group_name
+location = var.location
+databricks_sku = "premium"
+databricks_public_access_enabled_value = "true"
+databricks_no_public_ip = "false"
+private_subnet_name = module.prod-virtualnetwork.private_subnet_name
+private_subnet_id = module.prod-virtualnetwork.private_subnet_id
+public_subnet_name = module.prod-virtualnetwork.public_subnet_name
+public_subnet_id = module.prod-virtualnetwork.public_subnet_id
+virtual_network_id = module.prod-virtualnetwork.virtual_network_id
+virtual_network_address_space = "15.0.0.0/20"
+network_security_group_rules_required = "AllRules"
+
+}
+
+resource "azurerm_private_endpoint" "databricks_backend_pep" {
+  name                = "databricksbackendpep01"
+  resource_group_name = module.prod-resourcegroup.resource_group_name
+  location            = var.location
+  subnet_id           = module.prod-virtualnetwork.Private_endpoint_subnet_id
+
+  private_service_connection {
+    name                           = "datarbricksbepsc01"
+    private_connection_resource_id = module.prod-databricks_workspace.databricks_workspace_resource_id
+    is_manual_connection           = false
+    subresource_names              = ["databricks_ui_api"]
+  }
+}
+
+module "prod-databricks_access_connector" {
+  source = "./Modules/DatabricksConnector"
+  resource_group_name = module.prod-resourcegroup.resource_group_name
+  location = var.location
+  databricks_access_connector_name = "prod-databricks-ac-01"
+  
+}
+
+resource "azurerm_role_assignment" "access_connector_role_assignment" {
+  scope                = module.prod-storageaccount.storage_account_id
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = module.prod-databricks_access_connector.databricks_access_connector.identity[0].principal_id
+  depends_on = [ module.prod-resourcegroup ]
+}
+
+resource "azurerm_storage_data_lake_gen2_filesystem" "metastore_container" {
+ name               = var.metastore_container_name
+  storage_account_id = module.prod-storageaccount.storage_account_id
+}
+
+
+resource "databricks_metastore" "prod-metastore" {
+  name = "primary_metastore"
+  storage_root = format ("abfss://${var.metastore_container_name}@${module.prod-storageaccount.storage_account_name}.dfs.core.windows.net/")
+  force_destroy = true
+  
+}
+
+resource "databricks_metastore_data_access" "prod-metastore-access" {
+  metastore_id = databricks_metastore.prod-metastore.metastore_id
+  name         = "keys"
+  azure_managed_identity {
+    access_connector_id = module.prod-databricks_access_connector.databricks_access_connector_id
+  }
+
+  is_default = true
+  depends_on = [ databricks_metastore.prod-metastore]
+}
+
+resource "databricks_metastore_assignment" "prod-metastore-assignment" {
+  workspace_id         = module.prod-databricks_workspace.databricks_workspace_id
+  metastore_id         = databricks_metastore.prod-metastore.metastore_id
+  default_catalog_name = "hive_metastore"
+  
+}
+
+resource "databricks_grants" "name" {
+  volume = ""
+  metastore = ""
+  catalog = ""
+  schema = ""
+  storage_credential = ""
+  external_location = ""
+  connection = ""
+  table = ""
+share = ""
+}
